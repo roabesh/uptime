@@ -1,0 +1,144 @@
+# Внешний пробник доступности проектов.
+#
+# Зачем нужен отдельно от watchdog'ов: у каждого проекта есть свой сторож НА ЕГО ЖЕ
+# сервере. Если сервер умирает целиком, сторож умирает вместе с ним, и тишина
+# становится неотличима от «всё хорошо». Этот пробник работает на инфраструктуре
+# GitHub — он переживает смерть любого из серверов и способен об этом сказать.
+#
+# Почему репозиторий публичный: у публичных репозиториев GitHub Actions бесплатны
+# без лимита. У приватных тарифицируется КАЖДЫЙ ПРОГОН как целая минута (даже если
+# он длится 10 секунд) — 20.08.2026 квота аккаунта на этом кончилась, задачи
+# перестали стартовать, и мониторинг молча умер. Здесь этой проблемы нет.
+#
+# Безопасность:
+# - адреса ntfy-топиков (фактически пароли: кто знает топик — читает и пишет алерты)
+#   хранятся ТОЛЬКО в GitHub Secrets, они закрыты и в публичном репозитории;
+#   в коде — лишь имена секретов;
+# - домены и health-эндпоинты публичны сами по себе (DNS отвечает любому,
+#   сертификаты видны в Certificate Transparency), раскрывать тут нечего;
+# - никаких сторонних actions — только curl, поэтому нет supply-chain риска;
+# - триггеров pull_request нет: форк не может запустить это с секретами;
+# - permissions: contents: read — токен прогона не может писать в репозиторий.
+
+name: uptime
+
+on:
+  schedule:
+    # Раз в 10 минут: лимита у публичного репозитория нет, но чаще смысла мало —
+    # GitHub всё равно задерживает запуск планировщика на 5–15 минут.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Отправить тестовый алерт во все каналы (проверка секретов)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false          # падение одного проекта не отменяет проверку остальных
+      matrix:
+        include:
+          - name: Major Radar
+            url: https://major.yx8.ru/healthz
+            ready: https://major.yx8.ru/readyz
+            secret: NTFY_MAJOR_RADAR
+          - name: RunEvolution
+            url: https://run.yx8.ru/health
+            ready: ""
+            secret: NTFY_RUNEVOLUTION
+          - name: BillRazbil
+            url: https://billrazbil.ru/
+            ready: ""
+            secret: NTFY_BILLRAZBIL
+    env:
+      NTFY_URL: ${{ secrets[matrix.secret] }}
+    steps:
+      - name: Тест канала алертов
+        if: inputs.test_alert
+        run: |
+          # Канал проверяется только во время аварии — то есть когда чинить поздно.
+          # Этот шаг позволяет убедиться заранее, что секрет на месте и ntfy принимает.
+          if [ -z "${NTFY_URL:-}" ]; then
+            echo "::error::${{ matrix.name }}: секрет ${{ matrix.secret }} не задан — алерт отправить будет некуда."
+            exit 1
+          fi
+          curl -sS --fail --max-time 20 \
+            -d "🧪 ТЕСТ: внешний пробник (GitHub Actions) может слать алерты для «${{ matrix.name }}». Это не инцидент." \
+            "$NTFY_URL"
+          echo "тестовый алерт доставлен — канал рабочий"
+
+      - name: Проверить доступность
+        id: check
+        run: |
+          # Две попытки с паузой: одиночный сетевой сбой на раннере — не инцидент.
+          # curl сам печатает 000 через -w при обрыве соединения, поэтому НЕ дописываем
+          # своё `|| echo 000` — иначе в алерте получалось «HTTP 000000».
+          for attempt in 1 2; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "${{ matrix.url }}" 2>/dev/null)
+            [ -n "$code" ] || code=000
+            case "$code" in
+              2*|3*)
+                echo "${{ matrix.name }}: HTTP $code (попытка $attempt)"
+                echo "down=false" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+            echo "попытка $attempt: HTTP $code"
+            [ "$attempt" = 1 ] && sleep 30
+          done
+          echo "down=true" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+      - name: Проверить готовность (БД)
+        id: ready
+        if: matrix.ready != '' && steps.check.outputs.down != 'true'
+        run: |
+          # readyz отдаёт 503, когда недоступна БД: приложение отвечает, но данные
+          # не читаются. Две попытки — короткий блип БД не должен поднимать тревогу.
+          for attempt in 1 2; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "${{ matrix.ready }}" 2>/dev/null)
+            [ -n "$code" ] || code=000
+            if [ "$code" = "200" ]; then
+              echo "${{ matrix.name }}: readyz 200 (попытка $attempt)"
+              echo "notready=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "попытка $attempt: readyz HTTP $code"
+            [ "$attempt" = 1 ] && sleep 30
+          done
+          echo "notready=true" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+      - name: Алерт — сервис недоступен
+        if: steps.check.outputs.down == 'true'
+        run: |
+          msg=$(printf '🚨 %s недоступен снаружи: HTTP %s\nПроверял GitHub Actions (вне сервера), 2 попытки. Если локальный watchdog молчит — возможно, лёг весь сервер.' \
+            "${{ matrix.name }}" "${{ steps.check.outputs.code }}")
+          if [ -z "${NTFY_URL:-}" ]; then
+            echo "::error::Сервис недоступен, но секрет ${{ matrix.secret }} не задан — алерт отправить некуда."
+            exit 1
+          fi
+          curl -sS --fail --max-time 20 -d "$msg" "$NTFY_URL"
+          echo "алерт отправлен"
+
+      - name: Алерт — недоступна БД
+        if: steps.ready.outputs.notready == 'true'
+        run: |
+          msg=$(printf '⚠️ %s: сервис отвечает, но readyz → HTTP %s — недоступна БД.\nСтраницы отдаются, а данные не читаются.' \
+            "${{ matrix.name }}" "${{ steps.ready.outputs.code }}")
+          if [ -z "${NTFY_URL:-}" ]; then
+            echo "::error::БД недоступна, но секрет ${{ matrix.secret }} не задан — алерт отправить некуда."
+            exit 1
+          fi
+          curl -sS --fail --max-time 20 -d "$msg" "$NTFY_URL"
+          echo "алерт отправлен"
+
+      - name: Пометить прогон упавшим
+        if: steps.check.outputs.down == 'true' || steps.ready.outputs.notready == 'true'
+        run: exit 1

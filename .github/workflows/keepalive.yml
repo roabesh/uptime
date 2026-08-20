@@ -1,0 +1,39 @@
+# Защита от тихой смерти мониторинга.
+#
+# GitHub отключает запланированные workflow после 60 дней БЕЗ АКТИВНОСТИ В
+# РЕПОЗИТОРИИ. Прогоны по расписанию активностью не считаются — нужны коммиты.
+# То есть пробник, который просто исправно работает, через два месяца сам себя
+# выключает, и узнаёшь об этом ровно тогда, когда он понадобился.
+#
+# Этот workflow раз в месяц обновляет отметку времени в LAST-CHECK.txt — репозиторий
+# считается живым, расписание не отключается.
+#
+# Безопасность: право записи выдано ТОЛЬКО этому workflow и только на свой
+# репозиторий; триггера pull_request нет, поэтому чужой форк это не запустит.
+
+name: keepalive
+
+on:
+  schedule:
+    - cron: "0 4 1 * *"   # 1-го числа каждого месяца
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  touch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Обновить отметку
+        run: |
+          date -u '+Последняя отметка активности: %Y-%m-%d %H:%M UTC' > LAST-CHECK.txt
+          echo "" >> LAST-CHECK.txt
+          echo "Файл существует, чтобы GitHub не отключил расписание пробника" >> LAST-CHECK.txt
+          echo "после 60 дней без коммитов. Содержимое смысла не имеет." >> LAST-CHECK.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add LAST-CHECK.txt
+          git diff --staged --quiet || git commit -m "keepalive: отметка активности"
+          git push
